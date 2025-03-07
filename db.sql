@@ -1,6 +1,6 @@
-create database test41;
+create database test7;
 
-use test41;
+use test7;
 
 create table consumer_port(
     port_id int primary key,
@@ -9,12 +9,16 @@ create table consumer_port(
     location varchar(255) not null
 );
 
+desc consumer_port;
+
 create table seller_port(
     port_id int primary key,
     password varchar(255) not null,
     role varchar(255) not null,
     location varchar(255)
 );
+
+desc seller_port;
 
 -- ensure password column can store hashed values
 alter table
@@ -49,7 +53,7 @@ create table product (
     product_price decimal(10, 2) not null,
     product_quantity int not null,
     seller_id int,
-    constraint fk_seller foreign key (seller_id) references seller_port(port_id)
+    constraint fk_seller foreign key (seller_id) references seller_port(port_id) on delete cascade
 );
 
 -- table: product_backup
@@ -74,8 +78,8 @@ create table orders (
     delivered boolean not null,
     primary key (order_id, product_id),
     -- composite primary key
-    foreign key (consumer_port_id) references consumer_port(port_id),
-    foreign key (product_id) references product(product_id)
+    foreign key (consumer_port_id) references consumer_port(port_id) on delete cascade,
+    foreign key (product_id) references product(product_id) on delete cascade
 );
 
 -- backup table for orders
@@ -108,8 +112,8 @@ create table reported_product (
     report_date datetime not null,
     token varchar(255) unique not null,
     status enum('pending', 'resolved') default 'pending',
-    foreign key (consumer_port_id) references consumer_port(port_id),
-    foreign key (product_id) references product(product_id)
+    foreign key (consumer_port_id) references consumer_port(port_id) on delete cascade,
+    foreign key (product_id) references product(product_id) on delete cascade
 );
 
 -- table: backup_reported_product
@@ -166,9 +170,12 @@ values
         old.role,
         old.location
     );
+    
 
 end & & delimiter;
 
+
+desc consumer_port;
 -- consumer login page
 delimiter & & -- seller backup
 
@@ -1082,97 +1089,57 @@ end & & delimiter;
 
 -- procedure for reported products--
 -- procedure: add_report
-delimiter & & create procedure add_report(
-    p_consumer_port_id int,
-    p_product_id int,
-    p_issue_type enum(
-        'damage',
-        'wrong product',
-        'delayed',
-        'not received',
-        'missing'
-    ),
-    p_report_date datetime
-) begin declare v_token varchar(255);
+DELIMITER $$
 
-declare v_solution varchar(255);
+CREATE PROCEDURE add_report(
+    IN p_consumer_port_id INT,
+    IN p_product_id INT,
+    IN p_issue_type ENUM('damage', 'wrong product', 'delayed', 'not received', 'missing'),
+    IN p_report_date DATETIME
+)
+BEGIN
+    DECLARE v_token VARCHAR(255);
+    DECLARE v_solution VARCHAR(255);
 
--- check if the consumer has ordered the product
-if not exists (
-    select
-        1
-    from
-        orders
-    where
-        consumer_port_id = p_consumer_port_id
-        and product_id = p_product_id
-) then signal sqlstate '45000'
-set
-    message_text = 'consumer has not ordered this product';
+    -- Check if the consumer has ordered the product
+    IF NOT EXISTS (
+        SELECT 1
+        FROM orders
+        WHERE consumer_port_id = p_consumer_port_id
+        AND product_id = p_product_id
+    ) THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Consumer has not ordered this product';
+    END IF;
 
-end if;
+    -- Generate a unique token
+    SET v_token = UUID();  -- Using UUID() to generate a unique token
 
--- generate a unique token
-set
-    v_token = generate_token();
+    -- Propose solutions based on the issue type
+    CASE p_issue_type
+        WHEN 'damage' THEN
+            SET v_solution = 'replacement';
+        WHEN 'wrong product' THEN
+            SET v_solution = 'replacement';
+        WHEN 'delayed' THEN
+            SET v_solution = 'compensation';
+        WHEN 'not received' THEN
+            SET v_solution = 'resend';
+        WHEN 'missing' THEN
+            SET v_solution = 'resend';
+        ELSE
+            SET v_solution = 'investigation required';
+    END CASE;
 
--- propose solutions based on the issue type
-case
-    p_issue_type
-    when 'damage' then
-    set
-        v_solution = 'replacement';
+    -- Insert the report into the reports table
+    INSERT INTO reports (consumer_port_id, product_id, issue_type, report_date, token, solution)
+    VALUES (p_consumer_port_id, p_product_id, p_issue_type, p_report_date, v_token, v_solution);
 
-when 'wrong product' then
-set
-    v_solution = 'replacement';
+    -- Return the token and solution
+    SELECT v_token AS token, v_solution AS solution;
+END$$
 
-when 'delayed' then
-set
-    v_solution = 'compensation';
-
-when 'not received' then
-set
-    v_solution = 'resend';
-
-when 'missing' then
-set
-    v_solution = 'resend';
-
-else
-set
-    v_solution = 'investigation required';
-
-end case
-;
-
--- insert the report
-insert into
-    reported_product (
-        consumer_port_id,
-        product_id,
-        issue_type,
-        solution,
-        report_date,
-        token,
-        status
-    )
-values
-    (
-        p_consumer_port_id,
-        p_product_id,
-        p_issue_type,
-        v_solution,
-        p_report_date,
-        v_token,
-        'pending'
-    );
-
-select
-    'report submitted successfully. token: ' as message,
-    v_token as token;
-
-end & & delimiter;
+DELIMITER ;
 
 -- procedure: view_reports
 delimiter & & create procedure view_reports() begin
@@ -1204,190 +1171,106 @@ select
 
 end & & delimiter;
 
--- --procedure for sales analysis--
-delimiter & & 
-create procedure seller_sales_analysis(
-    in p_seller_id int,
-    in p_start_date datetime,
-    -- optional: start date for time-based analysis
-    in p_end_date datetime -- optional: end date for time-based analysis
-) begin declare total_products_ordered int;
+DELIMITER $$
 
-declare total_reported_products int;
-
-declare total_revenue decimal(10, 2);
-
-declare total_cost decimal(10, 2);
-
-declare profit_or_loss decimal(10, 2);
-
--- calculate total number of products ordered (with optional date range)
-select
-    sum(o.product_quantity) into total_products_ordered
-from
-    orders o
-    join product p on o.product_id = p.product_id
-where
-    p.seller_id = p_seller_id
-    and (
-        p_start_date is null
-        or o.order_date >= p_start_date
-    )
-    and (
-        p_end_date is null
-        or o.order_date <= p_end_date
-    );
-
--- calculate total number of reported products (with optional date range)
-select
-    count(*) into total_reported_products
-from
-    reported_product rp
-    join product p on rp.product_id = p.product_id
-where
-    p.seller_id = p_seller_id
-    and (
-        p_start_date is null
-        or rp.report_date >= p_start_date
-    )
-    and (
-        p_end_date is null
-        or rp.report_date <= p_end_date
-    );
-
--- calculate total revenue (with optional date range)
-select
-    sum(o.product_quantity * p.product_price) into total_revenue
-from
-    orders o
-    join product p on o.product_id = p.product_id
-where
-    p.seller_id = p_seller_id
-    and (
-        p_start_date is null
-        or o.order_date >= p_start_date
-    )
-    and (
-        p_end_date is null
-        or o.order_date <= p_end_date
-    );
-
--- calculate total cost (with optional date range)
-select
-    sum(o.product_quantity * p.cost_price) into total_cost
-from
-    orders o
-    join product p on o.product_id = p.product_id
-where
-    p.seller_id = p_seller_id
-    and (
-        p_start_date is null
-        or o.order_date >= p_start_date
-    )
-    and (
-        p_end_date is null
-        or o.order_date <= p_end_date
-    );
-
--- calculate profit or loss
-set
-    profit_or_loss = total_revenue - total_cost;
-
--- display the overall results
-select
-    total_products_ordered as 'total products ordered',
-    total_reported_products as 'total reported products',
-    total_revenue as 'total revenue',
-    total_cost as 'total cost',
-    profit_or_loss as 'profit or loss';
-
--- product-wise analysis (with optional date range)
-select
-    p.product_id,
-    p.product_name,
-    sum(o.product_quantity) as 'total quantity sold',
-    sum(o.product_quantity * p.product_price) as 'total revenue',
-    sum(o.product_quantity * p.cost_price) as 'total cost',
-    sum(o.product_quantity * p.product_price) - sum(o.product_quantity * p.cost_price) as 'profit or loss',
-    count(rp.report_id) as 'total reported issues'
-from
-    product p
-    left join orders o on p.product_id = o.product_id
-    left join reported_product rp on p.product_id = rp.product_id
-where
-    p.seller_id = p_seller_id
-    and (
-        p_start_date is null
-        or o.order_date >= p_start_date
-    )
-    and (
-        p_end_date is null
-        or o.order_date <= p_end_date
-    )
-    and (
-        p_start_date is null
-        or rp.report_date >= p_start_date
-    )
-    and (
-        p_end_date is null
-        or rp.report_date <= p_end_date
-    )
-group by
-    p.product_id,
-    p.product_name;
-
-end & & 
-delimiter ;
-
-CREATE TEMPORARY TABLE temp_cart (
-    product_id INT,
-    consumer_port_id INT ,
-    quantity INT DEFAULT 1,
-    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    foreign key (consumer_port_id) references consumer_port(port_id),
-    foreign key (product_id) references product(product_id)
-);
-
-
-DELIMITER //
-CREATE PROCEDURE add_to_cart(IN p_product_id INT, IN p_consumer_port_id INT, IN p_quantity INT)
-BEGIN
-    -- Check if the product already exists in the temporary cart
-    IF EXISTS (SELECT 1 FROM temp_cart WHERE product_id = p_product_id AND consumer_port_id = p_consumer_port_id) THEN
-        -- Update quantity if the product already exists
-        UPDATE temp_cart
-        SET quantity = quantity + p_quantity
-        WHERE product_id = p_product_id AND consumer_port_id = p_consumer_port_id;
-    ELSE
-        -- Insert new item into the temporary cart
-        INSERT INTO temp_cart (product_id, consumer_port_id, quantity)
-        VALUES (p_product_id, p_consumer_port_id, p_quantity);
-    END IF;
-END //
-DELIMITER ;
-
-DELIMITER //
-CREATE TRIGGER after_cart_checkout
-AFTER INSERT ON orders -- Assuming you have an `orders` table
+CREATE TRIGGER after_reported_product_insert
+AFTER INSERT ON reported_product
 FOR EACH ROW
 BEGIN
-    UPDATE products p
-    JOIN temp_cart tc ON p.product_id = tc.product_id
-    SET p.stock = p.stock - tc.quantity
-    WHERE tc.consumer_port_id = NEW.consumer_port_id;
+    DECLARE v_solution VARCHAR(255);
+
+    -- Propose solutions based on the issue type
+    CASE NEW.issue_type
+        WHEN 'damage' THEN
+            SET v_solution = 'replacement';
+        WHEN 'wrong product' THEN
+            SET v_solution = 'replacement';
+        WHEN 'delayed' THEN
+            SET v_solution = 'compensation';
+        WHEN 'not received' THEN
+            SET v_solution = 'resend';
+        WHEN 'missing' THEN
+            SET v_solution = 'resend';
+        ELSE
+            SET v_solution = 'investigation required';
+    END CASE;
+
+    -- Update the reported_product table with the proposed solution
+    UPDATE reported_product
+    SET solution = v_solution
+    WHERE report_id = NEW.report_id;
+END $$
+
+DELIMITER ;
+
+-- Procedure to add a product to the cart (in the orders table)
+DELIMITER //
+
+CREATE PROCEDURE AddToCart(
+IN p_consumer_id INT,
+IN p_product_id INT,
+IN p_quantity INT
+)
+BEGIN
+DECLARE v_stock INT;
+DECLARE v_price DECIMAL(10,2);
+DECLARE v_existing_quantity INT;
+
+SELECT product_quantity INTO v_existing_quantity
+FROM orders
+WHERE consumer_port_id = p_consumer_id AND product_id = p_product_id AND order_placed = FALSE;
+
+IF v_existing_quantity IS NOT NULL THEN
+UPDATE orders
+SET product_quantity = product_quantity + p_quantity
+WHERE consumer_port_id = p_consumer_id AND product_id = p_product_id AND order_placed = FALSE;
+ELSE
+INSERT INTO orders (order_date, order_placed, shipped, out_for_delivery, delivered, quantity, product_id, consumer_port_id)
+VALUES (CURDATE(), FALSE, FALSE, FALSE, FALSE, p_quantity, p_product_id, p_consumer_id);
+
+SELECT 'Product added to the cart.' AS Message;
+END IF;
+
 END //
+
 DELIMITER ;
 
 DELIMITER //
-CREATE PROCEDURE checkout_cart(IN p_consumer_port_id INT)
-BEGIN
-    -- Insert cart items into the orders table
-    INSERT INTO orders (consumer_port_id, product_id, quantity, order_date)
-    SELECT consumer_port_id, product_id, quantity, NOW()
-    FROM temp_cart
-    WHERE consumer_port_id = p_consumer_port_id;
 
-    -- Clear the user's cart
-    DELETE FROM temp_cart WHERE consumer_port_id = p_consumer_port_id;
+CREATE PROCEDURE RemoveFromCart(
+IN p_consumer_id INT,
+IN p_product_id INT
+)
+BEGIN
+DELETE FROM orders
+WHERE consumer_port_id = p_consumer_id AND product_id = p_product_id AND order_placed = FALSE;
+
+SELECT 'Product removed from cart.' AS Message;
 END //
+
+DELIMITER ;
+
+-- View Cart Items (New Procedure)
+DELIMITER //
+
+CREATE PROCEDURE ViewCartItems(IN consumerID INT)
+BEGIN
+
+SELECT
+p.product_id,
+p.product_name,
+o.product_quantity,
+p.product_price,
+(o.product_quantity * p.product_price) AS subtotal
+FROM orders o
+JOIN product p ON o.product_id = p.product_id
+WHERE o.consumer_port_id = consumerID AND o.order_placed = FALSE;
+
+SELECT SUM(o.product_quantity * p.product_price) AS total_price
+FROM orders o
+JOIN product p ON o.product_id = p.product_id
+WHERE o.consumer_port_id = consumerID AND o.order_placed = FALSE;
+
+END //
+
 DELIMITER ;
